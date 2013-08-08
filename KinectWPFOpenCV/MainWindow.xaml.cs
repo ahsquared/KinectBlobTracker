@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Timers;
 using System.Windows;
 using System.Windows.Media;
@@ -10,6 +12,7 @@ using Emgu.CV;
 using Emgu.CV.Structure;
 using System.IO;
 using Ventuz.OSC;
+using Timer = System.Timers.Timer;
 
 namespace KinectWPFOpenCV
 {
@@ -56,6 +59,10 @@ namespace KinectWPFOpenCV
         private int blobCount = 0;
         private MCvBox2D box;
 
+        // The Dispatcher and KinectSensor for background thread processing
+        private ProcessingThread processingThread;
+
+
         public MainWindow()
         {
             InitializeComponent();
@@ -100,7 +107,11 @@ namespace KinectWPFOpenCV
 
                 convertedImage = new FormatConvertedBitmap();
 
-                sensor.AllFramesReady += sensor_AllFramesReady;
+                this.processingThread = new ProcessingThread(sensor, this.sensor_AllFramesReady);
+                // We need to shut down the processing thread when this main thread is shut down.
+                this.Dispatcher.ShutdownStarted += this.Dispatcher_ShutdownStarted;
+
+                //sensor.AllFramesReady += sensor_AllFramesReady;
 
                 //_detector = new FGDetector<Bgr>(FORGROUND_DETECTOR_TYPE.FGD);
 
@@ -136,6 +147,24 @@ namespace KinectWPFOpenCV
             }
 
         }
+
+        private void ShutdownProcessingThread()
+        {
+            if (null != this.processingThread) {
+                var temp = this.processingThread;
+                this.processingThread = null;
+                temp.BeginInvokeShutdown();
+            }
+
+            // We're shut down - no need for this callback at this point.
+            this.Dispatcher.ShutdownStarted -= this.Dispatcher_ShutdownStarted;
+        }
+
+        private void Dispatcher_ShutdownStarted(object sender, EventArgs e)
+        {
+            this.ShutdownProcessingThread();
+        }
+
 
         private void CreateImageForTracking(WriteableBitmap bitmap, ColorImageFrame colorFrame, byte[] pixels)
         {
@@ -240,46 +269,44 @@ namespace KinectWPFOpenCV
             {
                 if (colorFrame != null)
                 {
-                    //depthBmp = depthFrame.SliceDepthImage((int)sliderMin.Value, (int)sliderMax.Value);
-                    blobCount = 0;
+                    this.Dispatcher.Invoke(DispatcherPriority.Background, (Action) (() =>
+                        {
+                            //depthBmp = depthFrame.SliceDepthImage((int)sliderMin.Value, (int)sliderMax.Value);
+                            blobCount = 0;
 
-                    if (IrEnabled && colorFrame.Format == ColorImageFormat.InfraredResolution640x480Fps30)
-                    {
-                        colorFrame.CopyPixelDataTo(irPixels);
-                        CreateImageForTracking(irBitmap, colorFrame, irPixels);
-                        TrackBlobs();
-                    }
-                    else if (!IrEnabled && colorFrame.Format == ColorImageFormat.RgbResolution640x480Fps30)
-                    {
-                        colorFrame.CopyPixelDataTo(colorPixels);
-                        //CreateImageForTracking(colorBitmap, colorFrame, colorPixels);
-                        colorBitmap.WritePixels(
-                            new Int32Rect(0, 0, colorBitmap.PixelWidth, colorBitmap.PixelHeight),
-                            colorPixels,
-                            colorBitmap.PixelWidth*colorFrame.BytesPerPixel,
-                            0);
-                        mainImg.Source = colorBitmap;
-                        return;
-                    }
-                    else
-                    {
-                        return;
-                    }
+                            if (IrEnabled && colorFrame.Format == ColorImageFormat.InfraredResolution640x480Fps30) {
+                                colorFrame.CopyPixelDataTo(irPixels);
+                                CreateImageForTracking(irBitmap, colorFrame, irPixels);
+                                TrackBlobs();
+                            }
+                            else if (!IrEnabled && colorFrame.Format == ColorImageFormat.RgbResolution640x480Fps30) {
+                                colorFrame.CopyPixelDataTo(colorPixels);
+                                //CreateImageForTracking(colorBitmap, colorFrame, colorPixels);
+                                colorBitmap.WritePixels(
+                                    new Int32Rect(0, 0, colorBitmap.PixelWidth, colorBitmap.PixelHeight),
+                                    colorPixels,
+                                    colorBitmap.PixelWidth * colorFrame.BytesPerPixel,
+                                    0);
+                                mainImg.Source = colorBitmap;
+                                return;
+                            }
+                            else {
+                                return;
+                            }
 
 
-                    //openCVImg.Save("c:\\opencvImage.bmp");
+                            //openCVImg.Save("c:\\opencvImage.bmp");
 
-                    if (switchImg)
-                    {
-                        mainImg.Source = ImageHelpers.ToBitmapSource(thresholdedImage);
-                        secondaryImg.Source = ImageHelpers.ToBitmapSource(openCVImg);
-                    }
-                    else
-                    {
-                        mainImg.Source = ImageHelpers.ToBitmapSource(openCVImg);
-                        secondaryImg.Source = ImageHelpers.ToBitmapSource(thresholdedImage);
-                    }
-                    txtBlobCount.Text = blobCount.ToString();
+                            if (switchImg) {
+                                mainImg.Source = ImageHelpers.ToBitmapSource(thresholdedImage);
+                                secondaryImg.Source = ImageHelpers.ToBitmapSource(openCVImg);
+                            }
+                            else {
+                                mainImg.Source = ImageHelpers.ToBitmapSource(openCVImg);
+                                secondaryImg.Source = ImageHelpers.ToBitmapSource(thresholdedImage);
+                            }
+                            txtBlobCount.Text = blobCount.ToString();
+                        }));
                 }
             }
         }
@@ -393,6 +420,128 @@ namespace KinectWPFOpenCV
             elements.Add(new OscElement(address + "/y", y));
             oscWriter.Send(new OscBundle(DateTime.Now, elements.ToArray()));
         }
+
+        /// <summary>
+        /// Helper class to receive frames and process them on a background thread.
+        /// </summary>
+        private class ProcessingThread
+        {
+            private readonly EventHandler<AllFramesReadyEventArgs> allFramesReady;
+            private readonly Action resetOutput;
+
+            private KinectSensor kinectSensor;
+            private Dispatcher dispatcher;
+
+            /// <summary>
+            /// Initializes a new instance of the ProcessingThread class, which will call the provided delegates when frames 
+            /// are ready or when the sensor has changed.
+            /// </summary>
+            /// <param name="kinectSensor">Optional initial value for the target KinectSensor.</param>
+            /// <param name="depthImageReady">Delegate to invoke when frames are ready.  Will be invoked on background thread.</param>
+            /// <param name="resetOutput">Delegate to invoke when the sensor is reset.  Will be invoked on background thread.</param>
+            public ProcessingThread(
+                KinectSensor kinectSensor,
+                EventHandler<AllFramesReadyEventArgs> allFramesReady)
+            {
+                if (null == allFramesReady) {
+                    throw new ArgumentNullException("allFramesReady");
+                }
+
+
+                this.allFramesReady = allFramesReady;
+
+                // Use this event to know when the processing thread has started.
+                var startEvent = new ManualResetEventSlim();
+                var processingThread = new Thread(this.ProcessFrameThread);
+                processingThread.Name = "KinectAllFramesReady-ProcessingThread";
+
+                // Start up the processing thread to do the depth conversion off of the main UI thread.
+                processingThread.Start(startEvent);
+
+                // Wait for the thread to start.
+                startEvent.Wait();
+
+                if (null == this.dispatcher) {
+                    throw new InvalidOperationException("StartEvent was signaled, but no Dispatcher was found.");
+                }
+
+                this.SensorChanged(null, kinectSensor);
+            }
+
+            /// <summary>
+            /// Method to invoke to change target KinectSensors.  May be called from any thread, though it is not thread safe.
+            /// </summary>
+            /// <param name="oldSensor">The old KinectSensor.</param>
+            /// <param name="newSensor">The new KinectSensor.</param>
+            public void SensorChanged(KinectSensor oldSensor, KinectSensor newSensor)
+            {
+                if (null == this.dispatcher) {
+                    throw new InvalidOperationException();
+                }
+
+                // Make sure to invoke this async on the processing thread.
+                this.dispatcher.BeginInvoke((Action)(() =>
+                {
+                    if (null != oldSensor) {
+                        this.kinectSensor.AllFramesReady -= this.allFramesReady;
+                        this.kinectSensor = null;
+                    }
+
+                    if (null != newSensor) {
+                        this.kinectSensor = newSensor;
+                        this.kinectSensor.AllFramesReady += this.allFramesReady;
+                    }
+                }));
+            }
+
+            /// <summary>
+            /// Begins the shutdown of the background thread.  Returns immediately, shutdown will be async.
+            /// </summary>
+            public void BeginInvokeShutdown()
+            {
+                this.dispatcher.BeginInvokeShutdown(DispatcherPriority.Normal);
+            }
+
+            // The thread process for processing
+            private void ProcessFrameThread(object startEventObj)
+            {
+                var startEvent = (ManualResetEventSlim)startEventObj;
+
+                try {
+                    var dispatcher = Dispatcher.CurrentDispatcher;
+
+                    // Post a work item to complete the handshake with the main thread so that we can ensure
+                    // that everything is running.
+                    dispatcher.BeginInvoke(DispatcherPriority.Background, (Action)(() =>
+                    {
+                        this.dispatcher = dispatcher;
+                        startEvent.Set();
+                    }));
+
+                    // Unsubscribe if we're being shut down.
+                    dispatcher.ShutdownStarted += (sender, args) =>
+                    {
+                        if (null != this.kinectSensor) {
+                            this.kinectSensor.AllFramesReady -= allFramesReady;
+                            this.kinectSensor = null;
+                        }
+                    };
+
+                    Dispatcher.Run();
+                }
+                catch (TaskCanceledException) {
+                    // Ignore this exception.  Gets thrown when we
+                    // shutdown the dispatcher while we are
+                    // waiting on a Dispatcher.Invoke
+                }
+                finally {
+                    // Even if something goes wrong, we should ensure that the event is set to 
+                    // unblock the main thread.
+                    startEvent.Set();
+                }
+            }
+        }
+
 
         #region processing a different way - not used
 
